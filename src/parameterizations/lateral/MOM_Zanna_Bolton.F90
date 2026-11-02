@@ -19,6 +19,7 @@ use MOM_domains,       only : pass_var, CORNER
 use MOM_cpu_clock,     only : cpu_clock_id, cpu_clock_begin, cpu_clock_end
 use MOM_cpu_clock,     only : CLOCK_MODULE, CLOCK_ROUTINE
 use MOM_ANN,           only : ANN_init, ANN_apply_array_sio, ANN_end, ANN_CS
+use MOM_error_handler, only : MOM_error, FATAL
 
 implicit none ; private
 
@@ -52,6 +53,8 @@ type, public :: ZB2020_CS ; private
                               !! 1: sqrt(sh_xx**2 + sh_xy**2 + vort_xy**2)
   integer   :: Marching_halo  !< The number of filter iterations per a single MPI
                               !! exchange
+  integer   :: boundary_discard !< The number of grid points near the boundary to discard
+                                !! by filtering the land mask
 
   real, dimension(:,:,:), allocatable :: &
           sh_xx,   & !< Horizontal tension (du/dx - dv/dy) in h (CENTER)
@@ -134,9 +137,12 @@ subroutine ZB2020_init(Time, G, GV, US, param_file, diag, CS, use_ZB2020)
 
   real :: subroundoff_Cor     ! A negligible parameter which avoids division by zero
                               ! but small compared to Coriolis parameter [T-1 ~> s-1]
+  real, dimension(SZI_(G),SZJ_(G),1) :: &
+        mask_boundary ! Mask in h points which is zeros near the boundary [nondim]
 
   integer :: is, ie, js, je, Isq, Ieq, Jsq, Jeq
   integer :: i, j
+  integer :: current_halo, remaining_iterations
 
   ! This include declares and sets the variable "version".
 #include "version_variable.h"
@@ -202,6 +208,9 @@ subroutine ZB2020_init(Time, G, GV, US, param_file, diag, CS, use_ZB2020)
   call get_param(param_file, mdl, "ZB_MARCHING_HALO", CS%Marching_halo, &
                  "The number of filter iterations per single MPI " //&
                  "exchange", default=4, do_not_log=(CS%Stress_iter==0).and.(CS%HPF_iter==0))
+
+  call get_param(param_file, mdl, "ZB_BOUNDARY_DISCARD", CS%boundary_discard, &
+                 "The number of grid points near the boundary to discard in ZB parameterization", default=0)
 
   ! Register fields for output from this module.
   CS%diag => diag
@@ -285,10 +294,49 @@ subroutine ZB2020_init(Time, G, GV, US, param_file, diag, CS, use_ZB2020)
     enddo ; enddo
   endif
 
-  if (CS%Stress_iter > 0 .or. CS%HPF_iter > 0) then
+  if (CS%Stress_iter > 0 .or. CS%HPF_iter > 0 .or. CS%boundary_discard > 0) then
     ! Include 1/16. factor to the mask for filter implementation
     allocate(CS%maskw_h(SZI_(G),SZJ_(G))) ; CS%maskw_h(:,:) = G%mask2dT(:,:) * 0.0625
     allocate(CS%maskw_q(SZIB_(G),SZJB_(G))) ; CS%maskw_q(:,:) = G%mask2dBu(:,:) * 0.0625
+  endif
+
+  ! This code block computes a mask of points which are away from
+  ! the coast by at least the number of boundary_discard grid points
+  ! We propagate the information from a coast line
+  ! by filtering the land mask
+  if (CS%boundary_discard > 0) then
+    ! Store 2D mask as 3D array because there is
+    ! missing implementation of filter for 2D arrays
+    mask_boundary(:,:,1) = G%mask2dT(:,:)
+
+    current_halo = min(G%Domain%nihalo, G%Domain%njhalo)
+    if (CS%boundary_discard > current_halo) then
+      call MOM_error(FATAL, "MOM_Zanna_Bolton, ZB2020_init: ZB_BOUNDARY_DISCARD must be " //&
+                    "less than or equal to the halo size.")
+    endif
+    remaining_iterations = CS%boundary_discard
+    call filter_3D(mask_boundary, CS%maskw_h,          &
+                   G%isd, G%ied, G%jsd, G%jed,         &
+                   G%isc, G%iec, G%jsc, G%jec, 1,      &
+                   current_halo, remaining_iterations, &
+                   .true.)
+    call pass_var(mask_boundary, G%Domain)
+
+    ! There is a coastline in a proximity of these points
+    do j=G%jsd,G%jed ; do i=G%isd,G%ied
+      if (mask_boundary(i,j,1) < 1.0) mask_boundary(i,j,1) = 0.
+    enddo ; enddo
+
+    ! Include mask into the scaling coefficient
+    do j=js-2,je+2 ; do i=is-2,ie+2
+      CS%kappa_h(i,j) = CS%kappa_h(i,j) * mask_boundary(i,j,1)
+    enddo ; enddo
+
+    do J=Jsq-2,Jeq+2 ; do I=Isq-2,Ieq+2
+      CS%kappa_q(I,J) = (CS%kappa_q(I,J) * 0.25) * &
+                        ((mask_boundary(i,j  ,1) + mask_boundary(i+1,j+1,1)) &
+                       + (mask_boundary(i,j+1,1) + mask_boundary(i+1,j  ,1)))
+    enddo ; enddo
   endif
 
   ! Initialize MPI group passes
@@ -340,7 +388,7 @@ subroutine ZB2020_end(CS)
     deallocate(CS%c_diss)
   endif
 
-  if (CS%Stress_iter > 0 .or. CS%HPF_iter > 0) then
+  if (CS%Stress_iter > 0 .or. CS%HPF_iter > 0 .or. CS%boundary_discard > 0) then
     deallocate(CS%maskw_h)
     deallocate(CS%maskw_q)
   endif
